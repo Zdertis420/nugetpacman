@@ -2,6 +2,7 @@ import requests
 import json
 import re
 from urllib.parse import urlencode
+from collections import deque
 
 
 def get_nuget_service_index():
@@ -67,44 +68,26 @@ def get_package_versions(package_id):
     pages = index_data.get("items", [])
 
     for page in pages:
-        if "items" in page:
-            # Inline items
-            for entry in page["items"]:
-                catalog_entry = entry.get("catalogEntry")
-                if isinstance(catalog_entry, dict):
-                    version = catalog_entry.get("version")
-                    if version:
-                        versions.append(version)
-                elif isinstance(catalog_entry, str):
-                    # If catalogEntry is a URL, fetch it
-                    cat_response = requests.get(catalog_entry)
-                    cat_response.raise_for_status()
-                    cat_data = cat_response.json()
-                    version = cat_data.get("version")
-                    if version:
-                        versions.append(version)
-        else:
-            # Fetch the page
-            page_url = page["@id"]
-            page_response = requests.get(page_url)
-            page_response.raise_for_status()
-            page_data = page_response.json()
-            for entry in page_data.get("items", []):
-                catalog_entry = entry.get("catalogEntry")
-                if isinstance(catalog_entry, dict):
-                    version = catalog_entry.get("version")
-                    if version:
-                        versions.append(version)
-                elif isinstance(catalog_entry, str):
-                    # If catalogEntry is a URL, fetch it
-                    cat_response = requests.get(catalog_entry)
-                    cat_response.raise_for_status()
-                    cat_data = cat_response.json()
-                    version = cat_data.get("version")
-                    if version:
-                        versions.append(version)
+        page_items = page.get("items")
+        if not page_items:
+            try:
+                page_response = requests.get(page["@id"])
+                page_response.raise_for_status()
+                page_data = page_response.json()
+                page_items = page_data.get("items", [])
+            except requests.RequestException:
+                continue
 
-    return versions
+        for entry in page_items:
+            catalog_entry = entry.get("catalogEntry")
+            if isinstance(catalog_entry, dict):
+                version = catalog_entry.get("version")
+                if version:
+                    versions.append(version)
+            elif "version" in entry:
+                versions.append(entry["version"])
+
+    return sorted(list(set(versions)), key=version_to_key, reverse=True)
 
 
 def get_package_dependencies(package_id, version):
@@ -122,18 +105,53 @@ def get_package_dependencies(package_id, version):
     version_lower = version.lower()  # Versions are normalized to lowercase in URLs
     leaf_url = f"{registrations_url}{package_id_lower}/{version_lower}.json"
 
-    response = requests.get(leaf_url)
-    response.raise_for_status()
-    data = response.json()
+    try:
+        response = requests.get(leaf_url)
+        # Некоторые старые версии могут не иметь .json, а быть в catalogEntry
+        if response.status_code == 404:
+            # Попробуем найти через index.json
+            index_url = f"{registrations_url}{package_id_lower}/index.json"
+            idx_resp = requests.get(index_url)
+            idx_resp.raise_for_status()
+            idx_data = idx_resp.json()
+            for page in idx_data.get("items", []):
+                for item in page.get("items", []):
+                    if (
+                        item.get("catalogEntry", {}).get("version", "").lower()
+                        == version_lower
+                    ):
+                        catalog_url = item.get("catalogEntry", {}).get("@id")
+                        if catalog_url:
+                            response = requests.get(catalog_url)
+                            break
+                if response.status_code == 200:
+                    break
+            if response.status_code == 404:
+                response.raise_for_status()
 
-    catalog_entry = data.get("catalogEntry")
-    if isinstance(catalog_entry, str):
-        # Fetch the catalog entry if it's a URL
-        catalog_response = requests.get(catalog_entry)
-        catalog_response.raise_for_status()
-        catalog_entry = catalog_response.json()
-    elif not isinstance(catalog_entry, dict):
-        raise ValueError("Unexpected type for catalogEntry")
+        response.raise_for_status()
+        data = response.json()
+
+        if "dependencyGroups" in data:
+            catalog_entry = data
+        elif "catalogEntry" in data:
+            catalog_entry_url_or_data = data.get("catalogEntry")
+            if isinstance(catalog_entry_url_or_data, str):
+                catalog_response = requests.get(catalog_entry_url_or_data)
+                catalog_response.raise_for_status()
+                catalog_entry = catalog_response.json()
+            elif isinstance(catalog_entry_url_or_data, dict):
+                catalog_entry = catalog_entry_url_or_data
+            else:
+                raise ValueError("Unexpected type for catalogEntry")
+        else:
+            catalog_entry = {}
+
+    except requests.RequestException as e:
+        print(
+            f"  [Error] Не удалось получить зависимости для {package_id} {version}: {e}"
+        )
+        return []
 
     dependency_groups = catalog_entry.get("dependencyGroups", [])
 
@@ -143,6 +161,8 @@ def get_package_dependencies(package_id, version):
         deps = group.get("dependencies", [])
         for dep in deps:
             dep_id = dep.get("id")
+            if not dep_id:
+                continue
             dep_range = dep.get("range", "*")
             dependencies.append(
                 {"framework": target_framework, "id": dep_id, "range": dep_range}
@@ -155,11 +175,11 @@ def version_to_key(v):
     Convert a version string to a sortable key, handling semantic versioning.
     """
     if v is None:
-        return ((), (0,), ())  # None sorts low
+        return ((), (0,), ())
     v = v.lower().strip()
     match = re.match(r"^(\d+(?:\.\d+)*)(?:-([^+]+))?(?:\+(.*))?$", v)
     if not match:
-        return ((), (0,), ())  # Invalid versions sort low
+        return ((), (0,), ())
     core_str, pre_str, build_str = match.groups()
     core_parts = tuple(int(x) for x in core_str.split(".") if x)
     if pre_str:
@@ -176,103 +196,145 @@ def version_to_key(v):
     return (core_parts, pre_key, build_key)
 
 
-def print_dependency_tree(
-    package_id,
-    version,
-    framework=None,
-    indent="",
-    visited=None,
-    current_depth=0,
-    max_depth=5,
+def build_dependency_graph_dfs(
+    start_package, start_version, framework=None, exclude_substring=None
 ):
     """
-    Print the dependency tree recursively, using the latest version for each dependency.
+    Построение графа зависимостей с использованием нерекурсивного DFS (обход в глубину).
 
-    :param package_id: The ID of the package.
-    :param version: The version of the package.
-    :param framework: Optional target framework to filter dependencies.
-    :param indent: Indentation string for tree structure.
-    :param visited: Set to track visited packages to avoid cycles.
-    :param current_depth: Current recursion depth.
-    :param max_depth: Maximum recursion depth to prevent too deep trees.
+    :param start_package: Корневой пакет.
+    :param start_version: Версия корневого пакета.
+    :param framework: (Опционально) Целевой фреймворк для фильтрации зависимостей.
+    :param exclude_substring: (Опционально) Подстрока для исключения пакетов из анализа.
+    :return: Словарь (граф), представляющий список смежности.
+             { 'PkgA': {'PkgB', 'PkgC'}, 'PkgB': set(), ... }
     """
-    if visited is None:
-        visited = set()
 
-    key = f"{package_id.lower()}.{version.lower()}"
-    if key in visited or current_depth > max_depth:
-        if current_depth > max_depth:
-            print(indent + f"{package_id} {version} (max depth reached)")
-        else:
-            print(indent + f"{package_id} {version} (cycle detected)")
+    print(f"Начало построения графа для: {start_package} v{start_version}")
+
+    if exclude_substring:
+        exclude_substring = exclude_substring.lower()
+        print(f"Исключаем пакеты, содержащие: '{exclude_substring}'")
+
+        if exclude_substring in start_package.lower():
+            print(f"Корневой пакет {start_package} исключен из анализа.")
+            return {}
+
+    stack = deque([(start_package, start_version)])
+
+    graph = {}
+
+    visited = set()
+
+    while stack:
+        try:
+            current_id, current_version = stack.pop()
+            current_id_lower = current_id.lower()
+
+            if current_id_lower in visited:
+                continue
+
+            visited.add(current_id_lower)
+
+            if current_id not in graph:
+                graph[current_id] = set()
+
+            print(f"  Анализ: {current_id} v{current_version}")
+
+            direct_deps = get_package_dependencies(current_id, current_version)
+
+            if framework:
+                deps_to_process = [
+                    d
+                    for d in direct_deps
+                    if d["framework"].lower() == framework.lower()
+                    or d["framework"] == "Any"
+                ]
+            else:
+                deps_to_process = direct_deps
+
+            for dep in deps_to_process:
+                dep_id = dep["id"]
+                dep_id_lower = dep_id.lower()
+
+                if exclude_substring and exclude_substring in dep_id_lower:
+                    print(f"    -> Пропуск (фильтр): {dep_id}")
+                    continue
+
+                graph[current_id].add(dep_id)
+
+                if dep_id_lower not in visited:
+                    versions = get_package_versions(dep_id)
+                    if not versions:
+                        print(f"    -> {dep_id} (версии не найдены)")
+                        continue
+
+                    latest_ver = versions[0]
+                    stack.append((dep_id, latest_ver))
+
+        except requests.RequestException as e:
+            print(f"  [Error] Ошибка при обработке {current_id}: {e}")
+        except Exception as e:
+            print(f"  [Fatal Error] Непредвиденная ошибка с {current_id}: {e}")
+
+    print("Построение графа завершено.")
+    return graph
+
+
+def print_graph(graph):
+    """
+    Аккуратно выводит граф зависимостей.
+    """
+    if not graph:
+        print("Граф пуст.")
         return
 
-    visited.add(key)
-
-    print(indent + f"{package_id} {version}")
-
-    direct_deps = get_package_dependencies(package_id, version)
-
-    if framework:
-        direct_deps = [
-            d
-            for d in direct_deps
-            if d["framework"] == framework or d["framework"] == "Any"
-        ]
-
-    for dep in direct_deps:
-        dep_id = dep["id"]
-        versions = get_package_versions(dep_id)
-        if not versions:
-            print(indent + "  " + f"{dep_id} (no versions found)")
-            continue
-
-        # Sort versions to find the latest
-        versions.sort(key=version_to_key, reverse=True)
-        latest_ver = versions[0]
-
-        # Note: This uses the latest version, but in practice, you should resolve based on the range.
-        print_dependency_tree(
-            dep_id,
-            latest_ver,
-            framework,
-            indent + "  ",
-            visited,
-            current_depth + 1,
-            max_depth,
-        )
-
-
-# Example usage
-if __name__ == "__main__":
-    # Search for packages
-    print("Searching for 'Newtonsoft.Json':")
-    results = search_packages("Newtonsoft.Json", take=1)
-    for pkg in results:
-        print(
-            f"Package: {pkg['id']}, Version: {pkg['version']}, Description: {pkg['description']}"
-        )
-
-    # Get versions
-    print("\nVersions of 'Newtonsoft.Json':")
-    versions = get_package_versions("Newtonsoft.Json")
-    print(versions)
-
-    # Get dependencies (using the version from search, which is typically the latest)
-    if results:
-        pkg = results[0]
-        print(f"\nDependencies for {pkg['id']} version {pkg['version']}:")
-        deps = get_package_dependencies(pkg["id"], pkg["version"])
-        if deps:
-            for dep in deps:
-                print(
-                    f"Framework: {dep['framework']}, ID: {dep['id']}, Range: {dep['range']}"
-                )
+    print("\n--- Граф зависимостей (Пакет -> [Зависимости]) ---")
+    for package, dependencies in sorted(graph.items()):
+        print(f"\n{package}:")
+        if dependencies:
+            for dep in sorted(list(dependencies)):
+                print(f"  -> {dep}")
         else:
-            print("No dependencies found.")
+            print("  (нет зависимостей)")
+    print("--------------------------------------------------")
 
-        # Print dependency tree
-        # Note: Newtonsoft.Json has no dependencies, so the tree will be simple.
-        # For a package with dependencies, replace with e.g., 'NuGet.Commands' or 'Microsoft.EntityFrameworkCore'
-        print("\nDependency tree:")
-        print_dependency_tree(pkg["id"], pkg["version"])
+
+if __name__ == "__main__":
+    START_PACKAGE = "Microsoft.EntityFrameworkCore"
+    FRAMEWORK_FILTER = None
+    EXCLUDE_FILTER = "microsoft.extensions"
+
+    print(f"Ищем последнюю версию для {START_PACKAGE}...")
+    try:
+        versions = get_package_versions(START_PACKAGE)
+        if not versions:
+            print("Не удалось найти версии.")
+            exit()
+
+        latest_version = versions[0]
+        print(f"Найдена версия: {latest_version}")
+
+        dependency_graph = build_dependency_graph_dfs(
+            START_PACKAGE,
+            latest_version,
+            framework=FRAMEWORK_FILTER,
+            exclude_substring=EXCLUDE_FILTER,
+        )
+
+        print_graph(dependency_graph)
+
+        print("\n\n--- Запускаем снова БЕЗ ФИЛЬТРАЦИИ ---")
+
+        dependency_graph_full = build_dependency_graph_dfs(
+            START_PACKAGE,
+            latest_version,
+            framework=FRAMEWORK_FILTER,
+            exclude_substring=None,
+        )
+        print_graph(dependency_graph_full)
+
+    except requests.RequestException as e:
+        print(f"\nОшибка API: {e}")
+    except ValueError as e:
+        print(f"\nОшибка данных: {e}")
