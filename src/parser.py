@@ -56,7 +56,6 @@ def get_package_versions(package_id):
     service_index = get_nuget_service_index()
     registrations_url = find_resource_url(service_index, "RegistrationsBaseUrl")
 
-    # Package IDs are lowercased in the URL
     package_id_lower = package_id.lower()
     index_url = f"{registrations_url}{package_id_lower}/index.json"
 
@@ -107,9 +106,7 @@ def get_package_dependencies(package_id, version):
 
     try:
         response = requests.get(leaf_url)
-        # Некоторые старые версии могут не иметь .json, а быть в catalogEntry
         if response.status_code == 404:
-            # Попробуем найти через index.json
             index_url = f"{registrations_url}{package_id_lower}/index.json"
             idx_resp = requests.get(index_url)
             idx_resp.raise_for_status()
@@ -207,7 +204,6 @@ def build_dependency_graph_dfs(
     :param framework: (Опционально) Целевой фреймворк для фильтрации зависимостей.
     :param exclude_substring: (Опционально) Подстрока для исключения пакетов из анализа.
     :return: Словарь (граф), представляющий список смежности.
-             { 'PkgA': {'PkgB', 'PkgC'}, 'PkgB': set(), ... }
     """
 
     print(f"Начало построения графа для: {start_package} v{start_version}")
@@ -281,6 +277,106 @@ def build_dependency_graph_dfs(
     return graph
 
 
+def get_reverse_dependencies(package_id, skip=0, take=100):
+    """
+    Get the direct reverse dependencies (packages that depend on this one) using the undocumented NuGet dependents API.
+
+    :param package_id: The ID of the package (case-insensitive).
+    :param skip: Number of results to skip (for pagination).
+    :param take: Number of results to return.
+    :return: List of dependent package IDs.
+    """
+    package_id = package_id  # Case-sensitive as per API
+    params = {
+        "packageId": package_id,
+        "projectType": "nuget",
+        "skip": skip,
+        "take": take,
+    }
+    url = f"https://api.nuget.org/v3/dependents?{urlencode(params)}"
+
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("data", [])
+    except requests.RequestException as e:
+        print(
+            f"  [Error] Не удалось получить обратные зависимости для {package_id}: {e}"
+        )
+        return []
+
+
+def build_reverse_dependency_graph_dfs(
+    start_package, exclude_substring=None, max_dependents_per_package=100
+):
+    """
+    Построение графа обратных зависимостей с использованием нерекурсивного DFS (обход в глубину).
+    Граф представляет пакеты, которые зависят от данного (dependents).
+
+    :param start_package: Корневой пакет.
+    :param exclude_substring: (Опционально) Подстрока для исключения пакетов из анализа.
+    :param max_dependents_per_package: Максимальное количество прямых dependents на пакет (для ограничения, так как может быть тысячи).
+    :return: Словарь (граф), где ключ - пакет, значение - set dependents.
+    """
+
+    print(f"Начало построения графа обратных зависимостей для: {start_package}")
+
+    if exclude_substring:
+        exclude_substring = exclude_substring.lower()
+        print(f"Исключаем пакеты, содержащие: '{exclude_substring}'")
+
+        if exclude_substring in start_package.lower():
+            print(f"Корневой пакет {start_package} исключен из анализа.")
+            return {}
+
+    stack = deque([start_package])
+
+    graph = {}
+
+    visited = set()
+
+    while stack:
+        try:
+            current_id = stack.pop()
+            current_id_lower = current_id.lower()
+
+            if current_id_lower in visited:
+                continue
+
+            visited.add(current_id_lower)
+
+            if current_id not in graph:
+                graph[current_id] = set()
+
+            print(f"  Анализ обратных зависимостей: {current_id}")
+
+            # Получаем только первые max_dependents_per_package (без пагинации дальше, чтобы избежать перегрузки)
+            direct_dependents = get_reverse_dependencies(
+                current_id, skip=0, take=max_dependents_per_package
+            )
+
+            for dep_id in direct_dependents:
+                dep_id_lower = dep_id.lower()
+
+                if exclude_substring and exclude_substring in dep_id_lower:
+                    print(f"    -> Пропуск (фильтр): {dep_id}")
+                    continue
+
+                graph[current_id].add(dep_id)
+
+                if dep_id_lower not in visited:
+                    stack.append(dep_id)
+
+        except requests.RequestException as e:
+            print(f"  [Error] Ошибка при обработке {current_id}: {e}")
+        except Exception as e:
+            print(f"  [Fatal Error] Непредвиденная ошибка с {current_id}: {e}")
+
+    print("Построение графа обратных зависимостей завершено.")
+    return graph
+
+
 def print_graph(graph):
     """
     Аккуратно выводит граф зависимостей.
@@ -301,9 +397,9 @@ def print_graph(graph):
 
 
 if __name__ == "__main__":
-    START_PACKAGE = "Microsoft.EntityFrameworkCore"
+    START_PACKAGE = "Newtonsoft.Json"
     FRAMEWORK_FILTER = None
-    EXCLUDE_FILTER = "microsoft.extensions"
+    EXCLUDE_FILTER = None
 
     print(f"Ищем последнюю версию для {START_PACKAGE}...")
     try:
@@ -324,7 +420,7 @@ if __name__ == "__main__":
 
         print_graph(dependency_graph)
 
-        print("\n\n--- Запускаем снова БЕЗ ФИЛЬТРАЦИИ ---")
+        print("\n\n--- БЕЗ ФИЛЬТРАЦИИ ---")
 
         dependency_graph_full = build_dependency_graph_dfs(
             START_PACKAGE,
@@ -333,6 +429,14 @@ if __name__ == "__main__":
             exclude_substring=None,
         )
         print_graph(dependency_graph_full)
+
+        print("\n\n--- ГРАФ ОБРАТНЫХ ЗАВИСИМОСТЕЙ ---")
+
+        reverse_dependency_graph = build_reverse_dependency_graph_dfs(
+            START_PACKAGE,
+            exclude_substring=EXCLUDE_FILTER,
+        )
+        print_graph(reverse_dependency_graph)
 
     except requests.RequestException as e:
         print(f"\nОшибка API: {e}")
