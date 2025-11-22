@@ -1,4 +1,4 @@
-```markdown
+
 # NuGet Dependency Graph Builder
 
 Этот проект — **Python-скрипт** для анализа и построения графа зависимостей NuGet-пакетов с использованием официального API NuGet V3.  
@@ -124,8 +124,3 @@ graph = build_dependency_graph_dfs(
 )
 print_graph(graph)
 ```
-
----
-
-
----
