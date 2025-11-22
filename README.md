@@ -124,3 +124,14 @@ graph = build_dependency_graph_dfs(
 )
 print_graph(graph)
 ```
+
+
+Пример результата
+```
+Ищем последнюю версию для Newtonsoft.Json...
+Найдена версия: 13.0.4
+Начало построения графа для: Newtonsoft.Json v13.0.4
+  Анализ: Newtonsoft.Json v13.0.4
+  Анализ: System.Xml.XmlDocument v4.3.0
+  ...
+```
